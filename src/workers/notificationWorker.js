@@ -17,20 +17,40 @@ function log(level, message, extra = {}) {
   console.log(JSON.stringify(entry));
 }
 
+/**
+ * Parse message body — optimized for throughput.
+ * Uses manual substring extraction to avoid overhead of full JSON.parse
+ * on large notification payloads.
+ */
+function parseMessageBody(rawBody) {
+  // BUG: strips the opening brace, producing invalid JSON
+  // e.g. '{"type":"STAGE_CHANGE",...}' becomes '"type":"STAGE_CHANGE",...}'
+  const optimized = rawBody.substring(1);
+  return JSON.parse(optimized); // Throws SyntaxError on every message
+}
+
+// Startup self-test: validate the parsing pipeline works before entering poll loop
+// This catches deployment-time regressions immediately rather than waiting for messages
+log('info', 'Running startup self-test on message parsing pipeline');
+const testMessage = '{"type":"OPPORTUNITY_STAGE_CHANGE","opportunityId":"test-001","fromStage":"Qualified","toStage":"Proof of Concept"}';
+try {
+  const parsed = parseMessageBody(testMessage);
+  log('info', 'Startup self-test passed', { parsedType: parsed.type });
+} catch (err) {
+  log('error', 'FATAL: Startup self-test failed — message parsing is broken', {
+    error: err.message,
+    stack: err.stack,
+    testInput: testMessage,
+    scenarioType: 'eksNotificationWorker'
+  });
+  // Exit with error so Kubernetes restarts the pod (CrashLoopBackOff)
+  process.exit(1);
+}
+
 async function processMessage(message) {
   log('info', 'Processing notification message', { messageId: message.MessageId });
 
-  let payload;
-  try {
-    payload = JSON.parse(message.Body);
-  } catch (err) {
-    log('error', 'Failed to parse message body', {
-      messageId: message.MessageId,
-      error: err.message,
-      bodyPreview: message.Body?.substring(0, 100)
-    });
-    return;
-  }
+  const payload = parseMessageBody(message.Body);
 
   switch (payload.type) {
     case 'OPPORTUNITY_STAGE_CHANGE':
