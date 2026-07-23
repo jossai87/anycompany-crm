@@ -1,0 +1,67 @@
+name: Deploy CRM Application
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/stacks/backend/contact-sync-service/src/services/contactService.js'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd lib/stacks/backend/contact-sync-service
+          docker build -t contact-sync-service .
+          docker tag contact-sync-service:latest $ECR_REGISTRY/contact-sync-service:$IMAGE_TAG
+          docker tag contact-sync-service:latest $ECR_REGISTRY/contact-sync-service:latest
+          docker push $ECR_REGISTRY/contact-sync-service:$IMAGE_TAG
+          docker push $ECR_REGISTRY/contact-sync-service:latest
+      - name: Register new ECS task definition
+        id: task-def
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition contact-sync-service --query taskDefinition)
+          NEW_IMAGE="$ECR_REGISTRY/contact-sync-service:$IMAGE_TAG"
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMAGE "$NEW_IMAGE" 'del(.taskDefinitionArn,.revision,.status,.registeredAt,.registeredBy,.requiresAttributes,.compatibilities) | .containerDefinitions[0].image = $IMAGE')
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query taskDefinition.taskDefinitionArn --output text)
+          echo "task_def_arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "Registered task definition: $NEW_TASK_DEF_ARN"
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster crm-ecs-cluster \
+            --service contact-sync-service \
+            --task-definition ${{ steps.task-def.outputs.task_def_arn }} \
+            --force-new-deployment
+          echo "Deployment initiated"
+      - name: Wait for deployment stability
+        timeout-minutes: 10
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster crm-ecs-cluster \
+            --services contact-sync-service
+      - name: Verify deployment
+        if: success()
+        run: |
+          aws ecs describe-services --cluster crm-ecs-cluster --services contact-sync-service --query 'services[0].{runningCount:runningCount,desiredCount:desiredCount,taskDefinition:taskDefinition}'
+          echo "Deployment successful!"
+      - name: Deployment failure diagnostics
+        if: failure()
+        run: |
+          echo "Deployment failed. Gathering diagnostics..."
+          aws ecs describe-services --cluster crm-ecs-cluster --services contact-sync-service --query 'services[0].{status:status,runningCount:runningCount,desiredCount:desiredCount}'

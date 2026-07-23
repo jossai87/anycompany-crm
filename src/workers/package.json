@@ -1,0 +1,8 @@
+{
+  "name": "crm-notification-worker",
+  "version": "1.0.0",
+  "main": "notificationWorker.js",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.400.0"
+  }
+}

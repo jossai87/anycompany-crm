@@ -1,0 +1,88 @@
+name: Deploy Notification Worker
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/workers/notificationWorker.js'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd src/workers
+          docker build -t crm-notification-worker .
+          docker tag crm-notification-worker:latest $ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          docker tag crm-notification-worker:latest $ECR_REGISTRY/crm-notification-worker:latest
+          docker push $ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          docker push $ECR_REGISTRY/crm-notification-worker:latest
+
+      - name: Deploy to EKS
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws eks update-kubeconfig --name devops-agent-eks --region ${{ secrets.AWS_REGION }}
+          # Best-effort self-registration. The CRM Lambda normally creates this access
+          # entry before the workflow runs; these are a fallback for that race.
+          aws eks create-access-entry --cluster-name devops-agent-eks --principal-arn ${{ secrets.AWS_ROLE_ARN }} --type STANDARD --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+          aws eks associate-access-policy --cluster-name devops-agent-eks --principal-arn ${{ secrets.AWS_ROLE_ARN }} --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy --access-scope type=cluster --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+          # Confirm kubectl can authenticate before continuing. Access entries can take
+          # a few seconds to propagate, so retry briefly and fail with a clear message.
+          authok=""
+          for i in 1 2 3 4 5 6; do
+            if kubectl auth can-i get pods >/dev/null 2>&1; then authok="yes"; break; fi
+            echo "Waiting for EKS access entry to propagate (attempt $i)..."
+            sleep 5
+          done
+          if [ -z "$authok" ]; then
+            echo "ERROR: GitHub Actions role cannot authenticate to the EKS cluster."
+            echo "The role's EKS access entry is missing. The CRM Failure Simulator backend"
+            echo "creates this automatically when you toggle the scenario or (re)connect GitHub."
+            echo "If this persists, re-open the CRM app, reconnect GitHub, and retry the toggle."
+            exit 1
+          fi
+          kubectl patch deployment crm-notification-worker --type=json             -p='[{"op":"remove","path":"/spec/template/spec/containers/0/command"}]' 2>/dev/null || true
+          QUEUE_URL=$(aws ssm get-parameter --name /workshop/crm/notification-queue-url --region ${{ secrets.AWS_REGION }} --query Parameter.Value --output text 2>/dev/null || echo "")
+          if [ -n "$QUEUE_URL" ]; then
+            kubectl set env deployment/crm-notification-worker QUEUE_URL="$QUEUE_URL" AWS_REGION="${{ secrets.AWS_REGION }}"
+          else
+            kubectl set env deployment/crm-notification-worker AWS_REGION="${{ secrets.AWS_REGION }}"
+          fi
+          kubectl set image deployment/crm-notification-worker crm-notification-worker=$ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          echo "Image updated, waiting for rollout..."
+
+      - name: Wait for rollout
+        timeout-minutes: 6
+        run: |
+          kubectl rollout status deployment/crm-notification-worker --timeout=300s
+          echo "Rollout complete"
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          kubectl get pods -l app=crm-notification-worker -o wide
+          echo "Deployment successful!"
+
+      - name: Deployment failure diagnostics
+        if: failure()
+        run: |
+          echo "Deployment failed. Gathering diagnostics..."
+          kubectl get pods -l app=crm-notification-worker -o wide
+          kubectl describe pods -l app=crm-notification-worker | tail -40
+          kubectl logs -l app=crm-notification-worker --tail=50 || true

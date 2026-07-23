@@ -1,0 +1,75 @@
+name: Deploy Report Generator
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/reports/reportGenerator.js'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Discover deployment targets
+        run: |
+          INSTANCE_ID=$(aws ssm get-parameter --name /workshop/crm/report-generator-instance-id --query 'Parameter.Value' --output text)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "Instance ID: $INSTANCE_ID"
+
+      - name: Upload code to SSM parameter
+        run: |
+          # Store the file content in SSM Parameter Store (avoids shell escaping in SSM commands)
+          CONTENT=$(cat src/reports/reportGenerator.js)
+          aws ssm put-parameter --name /workshop/crm/report-generator-code --value "$CONTENT" --type String --overwrite
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name AWS-RunShellScript \
+            --parameters '{"commands":["aws ssm get-parameter --name /workshop/crm/report-generator-code --query Parameter.Value --output text --region '${{ secrets.AWS_REGION }}' > /opt/crm-report-generator/reportGenerator.js","cd /opt/crm-report-generator && npm install --production 2>/dev/null || true","sudo systemctl restart crm-report-generator","echo DEPLOY_OK"]}' \
+            --query 'Command.CommandId' --output text)
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> $GITHUB_ENV
+
+      - name: Wait for SSM command
+        run: |
+          echo "Polling SSM command status..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "Attempt $i: $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deployment succeeded"
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Deployment failed with status: $STATUS"
+              aws ssm get-command-invocation --command-id "$command_id" --instance-id "$instance_id" --query 'StandardErrorContent' --output text || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          echo "Report generator deployed successfully"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Deployment failure diagnostics
+        if: failure()
+        run: |
+          echo "Deployment failed. Gathering diagnostics..."
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$instance_id" || true
